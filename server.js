@@ -114,20 +114,46 @@ function migrate(raw) {
       item.id = id;
     }
     usedIds.add(item.id);
-    item.frozenByRecallId ||= null;
-    for (const task of item.tasks || []) {
+    item.tasks ||= [];
+    item.logs ||= [];
+    for (const task of item.tasks) {
       if (!task.id) task.id = "T-" + (++db.seq);
       task.batchId = task.batchId ?? null;
       task.dependsOn = Array.isArray(task.dependsOn) ? task.dependsOn : [];
       task.logs ||= [];
     }
-    item.logs ||= [];
   }
+  // 批次/召回规范化，并建立 recallId → 召回 的索引供旧数据迁移
+  const recallById = new Map();
   for (const batch of db.batches) {
     batch.recalls ||= [];
     for (const recall of batch.recalls) {
       recall.checklist ||= [];
       recall.impact ||= [];
+      recallById.set(recall.id, recall);
+      for (const row of recall.checklist) {
+        if (row.priorStatus === undefined) {
+          const snapTask = recall.snapshot?.items?.[row.itemId]?.tasks?.find(t => t.id === row.taskId);
+          row.priorStatus = snapTask?.status ?? "待检查";
+        }
+      }
+    }
+  }
+  for (const item of db.items) {
+    // 旧版单召回冻结字段迁移为多召回列表
+    item.frozenRecallIds = Array.isArray(item.frozenRecallIds)
+      ? item.frozenRecallIds.filter(id => recallById.has(id))
+      : (item.frozenByRecallId && recallById.has(item.frozenByRecallId) ? [item.frozenByRecallId] : []);
+    delete item.frozenByRecallId;
+    if (item.frozenRecallIds.length) {
+      if (!item.freeze) {
+        // 旧版数据：从首个活动召回的冻结快照重建冻结前状态
+        const first = recallById.get(item.frozenRecallIds[0]);
+        item.freeze = { status: first?.snapshot?.items?.[item.id]?.status ?? "校准中", at: first?.createdAt ?? null };
+      }
+      item.status = FROZEN;
+    } else {
+      item.freeze = item.freeze || null;
     }
   }
   return db;
@@ -157,13 +183,10 @@ class RiggingApp {
     return batch;
   }
   #assertNotFrozen(item) {
-    if (item.frozenByRecallId) throw new HttpError(409, "item_frozen", "材料召回冻结中，校准/推进/交付已暂停");
+    if (item.frozenRecallIds?.length) throw new HttpError(409, "item_frozen", "材料召回冻结中，校准/推进/交付已暂停");
   }
   #activeRecall(batch) {
     return batch.recalls.find(r => r.status === "active");
-  }
-  #batchCode(db, id) {
-    return db.batches.find(b => b.id === id)?.code || "无批次";
   }
 
   // 直接使用该批次的索位 + 通过 dependsOn 反向闭包得到的后续依赖索位
@@ -219,7 +242,8 @@ class RiggingApp {
         owner: input.owner || "",
         dueDate: input.dueDate || "",
         status: stages.includes(input.status) ? input.status : "待检查",
-        frozenByRecallId: null,
+        frozenRecallIds: [],
+        freeze: null,
         tasks: [],
         logs: [{ at: this.store.now(), step: "建档", note: "创建模型" }]
       };
@@ -284,7 +308,7 @@ class RiggingApp {
       };
       item.tasks.push(task);
       item.status = "校准中";
-      item.logs.push({ at: this.store.now(), step: "帆索", note: position + " · " + (input.tension || "—") + "（批次：" + this.#batchCode(db, batchId) + "）" });
+      item.logs.push({ at: this.store.now(), step: "帆索", note: position + " · " + (input.tension || "—") + "（批次：" + (batchId ? db.batches.find(b => b.id === batchId).code : "无批次") + "）" });
       return { item, task, version: db.version + 1 };
     });
   }
@@ -326,14 +350,14 @@ class RiggingApp {
         createdAt: this.store.now(),
         status: "active",
         impact,
-        checklist: [],
-        snapshot: { items: {} }
+        checklist: []
       };
-      // 冻结：逐模型保存冻结前快照，状态改为已冻结，暂停校准、推进与交付
+      // 冻结：同一模型可被多个活动召回同时冻结；仅第一个召回保存冻结前状态
       for (const entry of impact) {
         const item = db.items.find(i => i.id === entry.itemId);
-        recall.snapshot.items[item.id] = structuredClone(item);
-        item.frozenByRecallId = recall.id;
+        const wasFrozen = item.frozenRecallIds.length > 0;
+        item.frozenRecallIds.push(recall.id);
+        if (!wasFrozen) item.freeze = { status: item.status, at: recall.createdAt };
         item.status = FROZEN;
         for (const taskId of entry.affectedTaskIds) {
           const task = item.tasks.find(t => t.id === taskId);
@@ -343,18 +367,35 @@ class RiggingApp {
             taskId,
             position: task.position,
             kind: entry.positions.some(p => p.taskId === taskId) ? "换料" : "复校",
+            priorStatus: task.status,
             done: false,
             doneAt: null
           });
         }
-        item.logs.push({ at: recall.createdAt, step: "召回冻结", note: "批次 " + batch.code + " 召回：" + reason + "，冻结校准/推进/交付" });
+        item.logs.push({
+          at: recall.createdAt,
+          step: "召回冻结",
+          recallId: recall.id,
+          note: "批次 " + batch.code + " 召回：" + reason + (wasFrozen ? "（叠加冻结，活动召回 " + item.frozenRecallIds.length + " 个）" : "，冻结校准/推进/交付")
+        });
       }
       batch.status = "recalled";
       batch.recalls.push(recall);
-      return { batch, recall: this.#publicRecall(recall), version: db.version + 1 };
+      return { batch, recall: this.#publicRecall(recall, db), version: db.version + 1 };
     });
   }
 
+  // 本召回涉及但已被其他活动召回覆盖的索位（共享依赖索位）
+  #coveredByOtherActiveRecall(db, itemId, taskId, recallId) {
+    for (const b of db.batches) {
+      for (const r of b.recalls) {
+        if (r.status === "active" && r.id !== recallId) {
+          if (r.checklist.some(row => row.itemId === itemId && row.taskId === taskId)) return true;
+        }
+      }
+    }
+    return false;
+  }
   completeChecklist(batchId, recallId, rowId, input, role) {
     return this.store.mutate(db => {
       this.#checkVersion(db, input);
@@ -371,9 +412,9 @@ class RiggingApp {
       row.done = true;
       row.doneAt = this.store.now();
       task.status = RECHECK_DONE;
-      task.logs.push({ at: row.doneAt, note: (row.kind === "换料" ? "换料并复校完成" : "依赖项复校完成") + (input.note ? "：" + input.note : "") });
-      item.logs.push({ at: row.doneAt, step: "换料复校", note: task.position + "（" + row.kind + "）完成，剩 " + recall.checklist.filter(r => !r.done).length + " 项" });
-      return { recall: this.#publicRecall(recall), version: db.version + 1 };
+      task.logs.push({ at: row.doneAt, recallId: recall.id, note: (row.kind === "换料" ? "换料并复校完成" : "依赖项复校完成") + (input.note ? "：" + input.note : "") });
+      item.logs.push({ at: row.doneAt, step: "换料复校", recallId: recall.id, note: task.position + "（" + row.kind + "）完成，剩 " + recall.checklist.filter(r => !r.done).length + " 项" });
+      return { recall: this.#publicRecall(recall, db), version: db.version + 1 };
     });
   }
 
@@ -387,21 +428,27 @@ class RiggingApp {
       if (recall.status !== "active") throw new HttpError(409, "recall_not_active", "召回流程已结束");
       const pending = recall.checklist.filter(r => !r.done);
       if (pending.length) throw new HttpError(409, "recall_recheck_incomplete", "仍有 " + pending.length + " 项换料复校未完成，不能解冻");
-      for (const entry of recall.impact) {
-        const item = db.items.find(i => i.id === entry.itemId);
-        const snap = recall.snapshot.items[item.id];
-        item.frozenByRecallId = null;
-        item.status = snap.status; // 回到冻结前所处环节
-        item.logs.push({ at: this.store.now(), step: "召回解冻", note: "批次 " + batch.code + " 换料复校全部完成，恢复校准/推进/交付" });
-      }
       recall.status = "closed";
       recall.closedAt = this.store.now();
-      batch.status = "closed";
-      return { recall: this.#publicRecall(recall), version: db.version + 1 };
+      if (!batch.recalls.some(r => r.status === "active")) batch.status = "closed";
+      // 仅当该模型没有其他活动召回时才真正解除冻结、恢复冻结前环节
+      for (const entry of recall.impact) {
+        const item = db.items.find(i => i.id === entry.itemId);
+        item.frozenRecallIds = item.frozenRecallIds.filter(id => id !== recall.id);
+        if (item.frozenRecallIds.length) {
+          item.logs.push({ at: recall.closedAt, step: "召回处置完成", recallId: recall.id, note: "批次 " + batch.code + " 换料复校完成；仍有 " + item.frozenRecallIds.length + " 个活动召回，冻结继续" });
+        } else {
+          const prior = item.freeze?.status ?? "校准中";
+          item.status = prior;
+          item.freeze = null;
+          item.logs.push({ at: recall.closedAt, step: "召回解冻", recallId: recall.id, note: "批次 " + batch.code + " 换料复校全部完成，全部活动召回结束，恢复校准/推进/交付（" + prior + "）" });
+        }
+      }
+      return { recall: this.#publicRecall(recall, db), version: db.version + 1 };
     });
   }
 
-  // 误报撤销：精确恢复冻结前快照（冻结期备注保留），批次回到正常
+  // 误报撤销：只回滚本召回产生的改动；其他活动召回的冻结与处置进度原样保留
   revokeRecall(batchId, recallId, input, role) {
     this.#requireRole(role, true);
     return this.store.mutate(db => {
@@ -410,28 +457,59 @@ class RiggingApp {
       const recall = batch.recalls.find(r => r.id === recallId);
       if (!recall) throw new HttpError(404, "recall_not_found", "召回记录不存在");
       if (recall.status !== "active") throw new HttpError(409, "recall_not_active", "召回流程已结束");
+      const now = this.store.now();
       for (const entry of recall.impact) {
-        const frozenItem = db.items.find(i => i.id === entry.itemId);
-        const freezeNotes = (frozenItem?.logs || []).filter(l => l.step === "备注" && l.at >= recall.createdAt);
-        const snap = structuredClone(recall.snapshot.items[entry.itemId]);
-        snap.logs.push({ at: this.store.now(), step: "误报撤销", note: "批次 " + batch.code + " 召回确认为误报，恢复冻结前状态" });
-        snap.logs.push(...freezeNotes);
-        const idx = db.items.findIndex(i => i.id === snap.id);
-        if (idx >= 0) db.items[idx] = snap; else db.items.push(snap);
+        const item = db.items.find(i => i.id === entry.itemId);
+        // 1) 回滚本召回标记过复校完成、且未被其他活动召回覆盖的索位
+        for (const row of recall.checklist) {
+          if (!row.done) continue;
+          const task = item.tasks.find(t => t.id === row.taskId);
+          if (!task) continue;
+          if (!this.#coveredByOtherActiveRecall(db, item.id, row.taskId, recall.id)) {
+            task.status = row.priorStatus;
+          }
+          task.logs = task.logs.filter(l => l.recallId !== recall.id);
+        }
+        // 2) 移除本召回写入的模型日志（冻结/复校/处置完成），冻结期无召回标记的备注保留
+        item.logs = item.logs.filter(l => l.recallId !== recall.id);
+        // 3) 从冻结集合摘掉本召回；还有其他活动召回则保持冻结
+        item.frozenRecallIds = item.frozenRecallIds.filter(id => id !== recall.id);
+        if (item.frozenRecallIds.length) {
+          item.logs.push({ at: now, step: "误报撤销", recallId: recall.id, note: "批次 " + batch.code + " 召回确认为误报；仍有 " + item.frozenRecallIds.length + " 个活动召回，冻结与处置进度保留" });
+        } else {
+          const prior = item.freeze?.status ?? "校准中";
+          item.status = prior;
+          item.freeze = null;
+          item.logs.push({ at: now, step: "误报撤销", recallId: recall.id, note: "批次 " + batch.code + " 召回确认为误报，恢复冻结前状态（" + prior + "）" });
+        }
       }
       recall.status = "revoked";
-      recall.revokedAt = this.store.now();
-      batch.status = "active";
-      return { recall: this.#publicRecall(recall), version: db.version + 1 };
+      recall.revokedAt = now;
+      if (!batch.recalls.some(r => r.status === "active")) batch.status = "active";
+      return { recall: this.#publicRecall(recall, db), version: db.version + 1 };
     });
   }
 
-  #publicRecall(recall) {
-    const { snapshot, ...rest } = recall;
+  #publicRecall(recall, db) {
+    const activeCountByItem = new Map();
+    if (db) {
+      for (const item of db.items) {
+        activeCountByItem.set(item.id, item.frozenRecallIds?.length || 0);
+      }
+    }
     return {
-      ...rest,
+      id: recall.id,
+      reason: recall.reason,
+      createdAt: recall.createdAt,
+      closedAt: recall.closedAt || null,
+      revokedAt: recall.revokedAt || null,
+      status: recall.status,
+      impact: recall.impact,
+      checklist: recall.checklist,
       total: recall.checklist.length,
-      done: recall.checklist.filter(r => r.done).length
+      done: recall.checklist.filter(r => r.done).length,
+      // 本召回已可解冻，但模型是否还有其他活动召回（决定冻结是否真正解除）
+      otherActiveByItem: db ? Object.fromEntries(recall.impact.map(en => [en.itemId, Math.max(0, (activeCountByItem.get(en.itemId) || 0) - (recall.status === "active" ? 1 : 0))])) : {}
     };
   }
 
@@ -446,13 +524,13 @@ class RiggingApp {
     const recalls = [];
     for (const batch of db.batches) {
       for (const recall of batch.recalls) {
-        recalls.push({ batchId: batch.id, batchCode: batch.code, ...this.#publicRecall(recall) });
+        recalls.push({ batchId: batch.id, batchCode: batch.code, ...this.#publicRecall(recall, db) });
       }
     }
     return {
       version: db.version,
       items,
-      batches: db.batches.map(b => ({ ...b, recalls: b.recalls.map(r => this.#publicRecall(r)) })),
+      batches: db.batches.map(b => ({ ...b, recalls: b.recalls.map(r => this.#publicRecall(r, db)) })),
       recalls
     };
   }
@@ -656,8 +734,9 @@ function page() {
       const main = fields.slice(0,4).map(([key,label]) => '<div><b>'+label+'</b> '+esc(item[key])+'</div>').join('');
       const tasks = (item.tasks || []).map(taskLine).join('');
       const logs = (item.logs || []).slice(-4).map(l => '<div>'+esc(l.step)+'：'+esc(l.note)+'</div>').join('');
-      const frozen = !!item.frozenByRecallId;
-      const head = '<h3>'+esc(item.code)+'</h3><div>'+(frozen?'<span class="pill frozen">召回冻结中</span> ':'')+'<span class="pill">'+esc(item.status)+'</span></div>';
+      const frozenCount = (item.frozenRecallIds || []).length;
+      const frozen = frozenCount > 0;
+      const head = '<h3>'+esc(item.code)+'</h3><div>'+(frozen?'<span class="pill frozen">召回冻结中'+(frozenCount>1?'（'+frozenCount+' 个活动召回）':'')+'</span> ':'')+'<span class="pill">'+esc(item.status)+'</span></div>';
       const select = '<label>状态</label><select data-status="'+esc(item.id)+'" '+(frozen?'disabled title="召回冻结中，禁止校准/推进/交付"':'')+'>'+stages.map(s => '<option '+(s===item.status?'selected':'')+'>'+s+'</option>').join('')+'</select>';
       return '<article class="card">'+head+main+tasks+select+'<button class="secondary" data-note="'+esc(item.id)+'">追加备注</button><div class="logs meta">'+(logs || '暂无记录')+'</div></article>';
     }
@@ -680,19 +759,23 @@ function page() {
     }
     function recallHtml(b, r) {
       const pct = r.total ? Math.round(r.done / r.total * 100) : 0;
+      const otherTotal = Math.max(0, ...Object.values(r.otherActiveByItem || {}));
+      const allDone = r.done >= r.total;
       const models = r.impact.map(en => {
         const pos = en.positions.map(p => '<li>'+esc(p.position)+'（'+esc(p.status)+'）</li>').join('');
         const dep = en.dependents.map(p => '<li>'+esc(p.position)+'（依赖项，'+esc(p.status)+'）</li>').join('');
-        return '<div class="meta">模型 <b>'+esc(en.code)+'</b>（'+esc(en.shipType)+'，负责人 '+esc(en.owner||'—')+'，冻结前：'+esc(en.status)+'）<ul style="margin:4px 0">'+pos+dep+'</ul></div>';
+        const other = (r.otherActiveByItem || {})[en.itemId] || 0;
+        return '<div class="meta">模型 <b>'+esc(en.code)+'</b>（'+esc(en.shipType)+'，负责人 '+esc(en.owner||'—')+'，冻结前：'+esc(en.status)+(other?'，另有 '+other+' 个活动召回':'')+'）<ul style="margin:4px 0">'+pos+dep+'</ul></div>';
       }).join('');
       const rows = r.checklist.map(row => '<div class="row"><span>'+esc(row.position) + ' <span class="pill">'+(row.kind==='换料'?'换料':'依赖复校')+'</span></span>'+(row.done?'<span class="meta">已于 '+esc((row.doneAt||'').replace('T',' ').slice(0,16))+' 完成</span>':'<button data-done="'+esc(b.id)+'|'+esc(r.id)+'|'+esc(row.id)+'">完成</button>')+'</div>').join('');
+      const freezeHint = allDone && otherTotal > 0 ? '完成本批次处置；模型仍有 '+otherTotal+' 个活动召回，冻结继续' : (allDone ? '本批次复校全部完成，且无其他活动召回：解冻并恢复冻结前状态' : '本批次全部复校完成后才能完成处置；所有活动召回结束前模型不会解冻');
       return '<div class="recall"><div><b>召回 '+esc(r.id)+'</b>：'+esc(r.reason)+' <span class="pill bad">处置中</span></div>'
         + '<div class="meta" style="margin:6px 0">影响模型 '+r.impact.length+' 个，受影响索位 '+r.total+' 个</div>'
         + models
         + '<div class="meta">换料复校进度 '+r.done+'/'+r.total+'</div><div class="progress"><i style="width:'+pct+'%"></i></div>'
         + rows
-        + (role()==='admin' ? '<div style="display:flex;gap:8px;margin-top:10px"><button class="freeze" data-unfreeze="'+esc(b.id)+'|'+esc(r.id)+'" '+(r.done<r.total?'disabled title="全部复校完成后才能解冻"':'')+'>解冻恢复</button><button class="secondary" data-revoke="'+esc(b.id)+'|'+esc(r.id)+'">误报撤销</button></div>'
-          : '<div class="meta" style="margin-top:8px">仅质量管理员可解冻或撤销；越权操作将被拒绝。</div>')
+        + (role()==='admin' ? '<div style="display:flex;gap:8px;margin-top:10px;flex-wrap:wrap"><button class="freeze" data-unfreeze="'+esc(b.id)+'|'+esc(r.id)+'" '+(allDone?'':'disabled')+' title="'+esc(freezeHint)+'">'+(allDone && otherTotal>0 ? '完成本批次处置（仍冻结）' : '解冻恢复')+'</button><button class="secondary" data-revoke="'+esc(b.id)+'|'+esc(r.id)+'">误报撤销</button></div><div class="meta" style="margin-top:6px">'+esc(freezeHint)+'</div>'
+          : '<div class="meta" style="margin-top:8px">仅质量管理员可解冻或撤销；越权操作将被拒绝。'+(otherTotal?'模型另有 '+otherTotal+' 个活动召回，所有活动召回结束前不会解冻。':'')+'</div>')
         + '</div>';
     }
     async function load() {
