@@ -13,6 +13,7 @@ describe("帆索批次召回", { concurrency: false }, () => {
     }
     async start() {
       await rm(this.file, { force: true });
+      this.curVer = 0;
       this.store = new JsonStore(this.file);
       await this.store.init();
       this.app = new RiggingApp(this.store);
@@ -582,8 +583,205 @@ describe("帆索批次召回", { concurrency: false }, () => {
     assert.equal(finalItem.frozenRecallIds.length, 0);
   });
 
-  test("旧版单召回数据迁移：frozenByRecallId 迁移为多召回列表并可继续处置", async () => {
-    // 手工写一份旧结构磁盘数据
+  // 完成某召回清单中指定索位（或全部未完成项）
+  async function completeRecallRows(bid, rid, taskIds) {
+    const s = await ctx.state();
+    let rows = s.recalls.find(x => x.id === rid).checklist.filter(x => !x.done);
+    if (taskIds) rows = rows.filter(x => taskIds.includes(x.taskId));
+    for (const row of rows) {
+      const done = await ctx.req("POST", `/api/batches/${bid}/recalls/${rid}/checklist/${row.id}`, {});
+      assert.equal(done.status, 200);
+    }
+  }
+  const taskStatus = (s, itemId, taskId) => s.items.find(i => i.id === itemId).tasks.find(t => t.id === taskId).status;
+
+  test("共享索位·先关闭再撤销：已关闭召回的复校完成结果不被后撤销的召回覆盖", async () => {
+    const { itemId, batchA, batchB, tA, tB, tD } = await ctx.twoBatchFixture();
+    await ctx.req("PATCH", "/api/items/" + itemId, { status: "待复核" });
+    let r = await ctx.req("POST", "/api/batches/" + batchA + "/recall", { reason: "A" }, "admin");
+    const recallA = r.data.recall.id;
+    r = await ctx.req("POST", "/api/batches/" + batchB + "/recall", { reason: "B" }, "admin");
+    const recallB = r.data.recall.id;
+
+    // A 全部完成并关闭（tA、tD 都被 A 标记复校完成）
+    await completeRecallRows(batchA, recallA);
+    r = await ctx.req("POST", `/api/batches/${batchA}/recalls/${recallA}/unfreeze`, {}, "admin");
+    assert.equal(r.status, 200);
+    let s = await ctx.state();
+    assert.equal(taskStatus(s, itemId, tD), "复校完成", "A关闭后共享索位为复校完成");
+    assert.equal(s.items.find(i => i.id === itemId).status, "已冻结", "B仍活动，模型冻结");
+
+    // B 只完成自己的直接索位 tB（tD 也在B清单里，保持未完成或已完成均应不影响结论；此处也完成它，随后撤销B）
+    await completeRecallRows(batchB, recallB);
+    // 撤销 B（误报）：tD 的完成结果仍被已关闭的 A 持有，必须保留
+    r = await ctx.req("POST", `/api/batches/${batchB}/recalls/${recallB}/revoke`, {}, "admin");
+    assert.equal(r.status, 200);
+    s = await ctx.state();
+    assert.equal(taskStatus(s, itemId, tD), "复校完成", "共享索位保留A已完成的处置结果，不退回应检");
+    assert.equal(taskStatus(s, itemId, tA), "复校完成", "A直接索位不受B撤销影响");
+    assert.equal(taskStatus(s, itemId, tB), "待检查", "B直接索位随B撤销回退到基线（待检查）");
+    const item = s.items.find(i => i.id === itemId);
+    assert.equal(item.status, "待复核", "最后一个活动召回结束，恢复冻结前状态");
+    assert.equal(item.frozenRecallIds.length, 0);
+  });
+
+  test("共享索位·先撤销再关闭：先撤销A，B完成共享索位后关闭，结果一致保留", async () => {
+    const { itemId, batchA, batchB, tA, tB, tD } = await ctx.twoBatchFixture();
+    await ctx.req("PATCH", "/api/items/" + itemId, { status: "待复核" });
+    let r = await ctx.req("POST", "/api/batches/" + batchA + "/recall", { reason: "A疑似" }, "admin");
+    const recallA = r.data.recall.id;
+    r = await ctx.req("POST", "/api/batches/" + batchB + "/recall", { reason: "B真异常" }, "admin");
+    const recallB = r.data.recall.id;
+
+    // A 标记 tA、tD 完成后撤销（误报）；此时 B 尚未完成 tD，tD 回退到召回前基线
+    await completeRecallRows(batchA, recallA);
+    r = await ctx.req("POST", `/api/batches/${batchA}/recalls/${recallA}/revoke`, {}, "admin");
+    assert.equal(r.status, 200);
+    let s = await ctx.state();
+    assert.equal(taskStatus(s, itemId, tD), "待检查", "没有其他召回持有完成结果时回退基线");
+    assert.equal(taskStatus(s, itemId, tA), "待检查", "A直接索位随A撤销回退");
+    assert.equal(s.items.find(i => i.id === itemId).status, "已冻结", "B仍活动，继续冻结");
+
+    // B 完成全部项（含 tD）并关闭：tD 由 B 复校完成
+    await completeRecallRows(batchB, recallB);
+    r = await ctx.req("POST", `/api/batches/${batchB}/recalls/${recallB}/unfreeze`, {}, "admin");
+    assert.equal(r.status, 200);
+    s = await ctx.state();
+    assert.equal(taskStatus(s, itemId, tD), "复校完成", "B关闭后共享索位为复校完成");
+    assert.equal(taskStatus(s, itemId, tB), "复校完成", "B直接索位完成");
+    assert.equal(s.items.find(i => i.id === itemId).status, "待复核", "恢复冻结前状态");
+    // 批次终态：A 恢复正常（误报），B 已关闭
+    assert.equal(s.batches.find(b => b.id === batchA).status, "active");
+    assert.equal(s.batches.find(b => b.id === batchB).status, "closed");
+  });
+
+  test("双方都完成并先后关闭：共享索位保持复校完成，模型仅在最后一个关闭时恢复", async () => {
+    const { itemId, batchA, batchB, tD } = await ctx.twoBatchFixture();
+    await ctx.req("PATCH", "/api/items/" + itemId, { status: "已交付" });
+    let r = await ctx.req("POST", "/api/batches/" + batchA + "/recall", { reason: "A" }, "admin");
+    const recallA = r.data.recall.id;
+    r = await ctx.req("POST", "/api/batches/" + batchB + "/recall", { reason: "B" }, "admin");
+    const recallB = r.data.recall.id;
+    await completeRecallRows(batchA, recallA);
+    await completeRecallRows(batchB, recallB);
+
+    r = await ctx.req("POST", `/api/batches/${batchA}/recalls/${recallA}/unfreeze`, {}, "admin");
+    assert.equal(r.status, 200);
+    let s = await ctx.state();
+    assert.equal(s.items.find(i => i.id === itemId).status, "已冻结", "关A后仍被B冻结");
+    assert.equal(taskStatus(s, itemId, tD), "复校完成");
+
+    r = await ctx.req("POST", `/api/batches/${batchB}/recalls/${recallB}/unfreeze`, {}, "admin");
+    assert.equal(r.status, 200);
+    s = await ctx.state();
+    assert.equal(taskStatus(s, itemId, tD), "复校完成", "双方关闭后共享索位仍完成");
+    assert.equal(s.items.find(i => i.id === itemId).status, "已交付", "恢复冻结前（已交付）环节");
+    assert.equal(s.batches.find(b => b.id === batchA).status, "closed");
+    assert.equal(s.batches.find(b => b.id === batchB).status, "closed");
+  });
+
+  test("顺序无关性：先关闭再撤销与先撤销再关闭，共享索位终态一致", async () => {
+    async function run(order) {
+      const f = await ctx.twoBatchFixture();
+      await ctx.req("PATCH", "/api/items/" + f.itemId, { status: "待复核" });
+      let ra = await ctx.req("POST", "/api/batches/" + f.batchA + "/recall", { reason: "A" }, "admin");
+      const idA = ra.data.recall.id;
+      let rb = await ctx.req("POST", "/api/batches/" + f.batchB + "/recall", { reason: "B" }, "admin");
+      const idB = rb.data.recall.id;
+      await completeRecallRows(f.batchA, idA);
+      await completeRecallRows(f.batchB, idB);
+      const close = id => ctx.req("POST", `/api/batches/${id === idA ? f.batchA : f.batchB}/recalls/${id}/unfreeze`, {}, "admin");
+      const revoke = id => ctx.req("POST", `/api/batches/${id === idA ? f.batchA : f.batchB}/recalls/${id}/revoke`, {}, "admin");
+      if (order === "close-then-revoke") { await close(idA); await revoke(idB); }
+      else { await revoke(idA); await close(idB); }
+      const s = await ctx.state();
+      return {
+        shared: taskStatus(s, f.itemId, f.tD),
+        item: s.items.find(i => i.id === f.itemId).status,
+        frozen: s.items.find(i => i.id === f.itemId).frozenRecallIds.length
+      };
+    }
+    // 关闭后再撤销的组合与撤销后再关闭的组合，共享索位都保留完成态（完成方先结案）
+    // 两种顺序的差异只在哪个批次关闭/误报，但共享索位结果一致
+    await ctx.stop(); await ctx.start();
+    const a = await run("close-then-revoke");
+    await ctx.stop(); await ctx.start();
+    const b = await run("revoke-then-close");    assert.equal(a.shared, "复校完成");
+    assert.equal(b.shared, "复校完成", "两种处置顺序共享索位终态一致");
+    assert.equal(a.item, "待复核");
+    assert.equal(b.item, "待复核", "两种顺序模型都恢复冻结前状态");
+    assert.equal(a.frozen, 0);
+    assert.equal(b.frozen, 0);
+  });
+
+  test("重复撤销与重复关闭拒绝；已结束召回不能再操作", async () => {
+    const { itemId, batchA, batchB } = await ctx.twoBatchFixture();
+    let r = await ctx.req("POST", "/api/batches/" + batchA + "/recall", { reason: "A" }, "admin");
+    const recallA = r.data.recall.id;
+    r = await ctx.req("POST", "/api/batches/" + batchB + "/recall", { reason: "B" }, "admin");
+    const recallB = r.data.recall.id;
+
+    // A 未完成不能关闭
+    r = await ctx.req("POST", `/api/batches/${batchA}/recalls/${recallA}/unfreeze`, {}, "admin");
+    assert.equal(r.status, 409);
+    assert.equal(r.data.error, "recall_recheck_incomplete");
+    // 撤销 A
+    r = await ctx.req("POST", `/api/batches/${batchA}/recalls/${recallA}/revoke`, {}, "admin");
+    assert.equal(r.status, 200);
+    // 重复撤销
+    r = await ctx.req("POST", `/api/batches/${batchA}/recalls/${recallA}/revoke`, {}, "admin");
+    assert.equal(r.status, 409);
+    assert.equal(r.data.error, "recall_not_active");
+    // 已撤销的召回不能关闭
+    r = await ctx.req("POST", `/api/batches/${batchA}/recalls/${recallA}/unfreeze`, {}, "admin");
+    assert.equal(r.status, 409);
+    assert.equal(r.data.error, "recall_not_active");
+
+    // B 完成后关闭，再重复关闭/撤销均拒绝
+    await completeRecallRows(batchB, recallB);
+    r = await ctx.req("POST", `/api/batches/${batchB}/recalls/${recallB}/unfreeze`, {}, "admin");
+    assert.equal(r.status, 200);
+    r = await ctx.req("POST", `/api/batches/${batchB}/recalls/${recallB}/unfreeze`, {}, "admin");
+    assert.equal(r.status, 409);
+    r = await ctx.req("POST", `/api/batches/${batchB}/recalls/${recallB}/revoke`, {}, "admin");
+    assert.equal(r.status, 409);
+  });
+
+  test("共享索位处置顺序·重启持久化：先关闭A再部分处置B后重启，撤销B不覆盖A结果", async () => {
+    const { itemId, batchA, batchB, tD } = await ctx.twoBatchFixture();
+    await ctx.req("PATCH", "/api/items/" + itemId, { status: "待复核" });
+    let r = await ctx.req("POST", "/api/batches/" + batchA + "/recall", { reason: "A" }, "admin");
+    const recallA = r.data.recall.id;
+    r = await ctx.req("POST", "/api/batches/" + batchB + "/recall", { reason: "B" }, "admin");
+    const recallB = r.data.recall.id;
+    await completeRecallRows(batchA, recallA);
+    await ctx.req("POST", `/api/batches/${batchA}/recalls/${recallA}/unfreeze`, {}, "admin");
+    // B 完成共享索位一项后重启
+    const s0 = await ctx.state();
+    const bRowD = s0.recalls.find(x => x.id === recallB).checklist.find(x => x.taskId === tD);
+    await ctx.req("POST", `/api/batches/${batchB}/recalls/${recallB}/checklist/${bRowD.id}`, {});
+
+    await new Promise(res => ctx.server.close(res));
+    ctx.store = new JsonStore(ctx.file);
+    await ctx.store.init();
+    ctx.app = new RiggingApp(ctx.store);
+    ctx.server = createServer(ctx.app);
+    await new Promise(resolve => ctx.server.listen(0, resolve));
+    ctx.base = "http://localhost:" + ctx.server.address().port;
+
+    let s = await ctx.state();
+    assert.equal(taskStatus(s, itemId, tD), "复校完成", "重启后共享索位完成态保留");
+    assert.equal(s.recalls.find(x => x.id === recallA).status, "closed");
+    assert.equal(s.recalls.find(x => x.id === recallB).status, "active");
+    // 重启后撤销 B：A 已关闭，其完成结果继续保留
+    r = await ctx.req("POST", `/api/batches/${batchB}/recalls/${recallB}/revoke`, {}, "admin");
+    assert.equal(r.status, 200);
+    s = await ctx.state();
+    assert.equal(taskStatus(s, itemId, tD), "复校完成", "重启后撤销B仍不覆盖A的已结案结果");
+    assert.equal(s.items.find(i => i.id === itemId).status, "待复核");
+  });
+
+  test("旧版单召回数据迁移：frozenByRecallId 迁移为多召回列表并可继续处置", async () => {    // 手工写一份旧结构磁盘数据
     const oldFile = "/tmp/rig-legacy-" + process.pid + "-" + Math.random().toString(36).slice(2) + ".json";
     const { writeFile, rm } = await import("node:fs/promises");
     try {

@@ -385,16 +385,29 @@ class RiggingApp {
     });
   }
 
-  // 本召回涉及但已被其他活动召回覆盖的索位（共享依赖索位）
-  #coveredByOtherActiveRecall(db, itemId, taskId, recallId) {
+  // 该索位的复校完成结果是否仍被其他「未撤销」召回（活动或已关闭）持有
+  #taskCompletionHeldElsewhere(db, itemId, taskId, recallId) {
     for (const b of db.batches) {
       for (const r of b.recalls) {
-        if (r.status === "active" && r.id !== recallId) {
-          if (r.checklist.some(row => row.itemId === itemId && row.taskId === taskId)) return true;
-        }
+        if (r.id === recallId || r.status === "revoked") continue;
+        if (r.checklist.some(row => row.itemId === itemId && row.taskId === taskId && row.done)) return true;
       }
     }
     return false;
+  }
+  // 索位在任何召回触及它之前的基线状态：取最早召回记录的 priorStatus
+  #taskBaselineStatus(db, itemId, taskId, fallback) {
+    let best = null;
+    let bestSeq = Infinity;
+    for (const b of db.batches) {
+      for (const r of b.recalls) {
+        const row = r.checklist.find(x => x.itemId === itemId && x.taskId === taskId);
+        if (!row) continue;
+        const seq = Number(String(r.id).replace(/^R-/, "")) || 0;
+        if (seq < bestSeq) { bestSeq = seq; best = row.priorStatus; }
+      }
+    }
+    return best ?? fallback;
   }
   completeChecklist(batchId, recallId, rowId, input, role) {
     return this.store.mutate(db => {
@@ -460,13 +473,14 @@ class RiggingApp {
       const now = this.store.now();
       for (const entry of recall.impact) {
         const item = db.items.find(i => i.id === entry.itemId);
-        // 1) 回滚本召回标记过复校完成、且未被其他活动召回覆盖的索位
+        // 1) 回滚本召回标记过复校完成的索位：
+        //    其他未撤销召回（活动或已关闭）仍持有完成结果则保留；否则恢复到最早召回前的基线状态
         for (const row of recall.checklist) {
           if (!row.done) continue;
           const task = item.tasks.find(t => t.id === row.taskId);
           if (!task) continue;
-          if (!this.#coveredByOtherActiveRecall(db, item.id, row.taskId, recall.id)) {
-            task.status = row.priorStatus;
+          if (!this.#taskCompletionHeldElsewhere(db, item.id, row.taskId, recall.id)) {
+            task.status = this.#taskBaselineStatus(db, item.id, row.taskId, row.priorStatus);
           }
           task.logs = task.logs.filter(l => l.recallId !== recall.id);
         }
